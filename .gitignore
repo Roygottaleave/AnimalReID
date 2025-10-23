@@ -1,0 +1,10 @@
+# 忽略数据和模型文件夹
+data/
+models/
+outputs/checkpoints/
+*.pth
+*.pt
+*.pkl
+__pycache__/
+*.pyc
+.DS_Store
