@@ -35,6 +35,27 @@ class MegaDescriptorFinetuner:
         os.makedirs(self.config['output']['checkpoint_dir'], exist_ok=True)
         os.makedirs(self.config['output']['log_dir'], exist_ok=True)
     
+    def _save_checkpoint(self, epoch, metric_value):
+        """保存检查点"""
+        checkpoint = {
+            'epoch': epoch,
+            'backbone_state_dict': self.backbone.state_dict(),
+            'objective_state_dict': self.objective.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'metric_value': metric_value,
+            'config': self.config,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        checkpoint_path = os.path.join(
+            self.config['output']['checkpoint_dir'], 
+            f'checkpoint_epoch_{epoch:03d}.pth'
+        )
+        
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved: {checkpoint_path}")
+    
     def prepare_data(self):
         """准备训练数据"""
 
@@ -112,18 +133,22 @@ class MegaDescriptorFinetuner:
         # 设置优化器
         params = itertools.chain(self.backbone.parameters(), self.objective.parameters())
         
+        # 确保学习率和权重衰减是正确类型
+        lr = float(self.config['training']['learning_rate'])
+        weight_decay = float(self.config['training']['weight_decay'])
+        
         if self.config['training']['optimizer'].lower() == 'adamw':
             self.optimizer = AdamW(
                 params=params,
-                lr=self.config['training']['learning_rate'],
-                weight_decay=self.config['training']['weight_decay']
+                lr=lr,
+                weight_decay=weight_decay
             )
         else:
             self.optimizer = SGD(
                 params=params,
-                lr=self.config['training']['learning_rate'],
+                lr=lr,
                 momentum=0.9,
-                weight_decay=self.config['training']['weight_decay']
+                weight_decay=weight_decay
             )
         
         # 学习率调度器
@@ -139,7 +164,7 @@ class MegaDescriptorFinetuner:
         print(f"Backbone: {self.config['model']['name']}")
         print(f"Number of classes: {num_classes}")
         print(f"Optimizer: {self.config['training']['optimizer']}")
-        print(f"Learning rate: {self.config['training']['learning_rate']}")
+        print(f"Learning rate: {lr}")
     
     def create_trainer(self):
         """创建训练器"""
@@ -181,27 +206,6 @@ class MegaDescriptorFinetuner:
         )
         
         return self.trainer
-        
-        def _save_checkpoint(self, epoch, val_accuracy):
-            """保存检查点"""
-            checkpoint = {
-                'epoch': epoch,
-                'backbone_state_dict': self.backbone.state_dict(),
-                'objective_state_dict': self.objective.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-                'val_accuracy': val_accuracy,
-                'config': self.config,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            checkpoint_path = os.path.join(
-                self.config['output']['checkpoint_dir'], 
-                f'checkpoint_epoch_{epoch:03d}.pth'
-            )
-            
-            torch.save(checkpoint, checkpoint_path)
-            print(f"Checkpoint saved: {checkpoint_path}")
     
     def train(self):
         """执行训练"""
