@@ -1,7 +1,8 @@
 # 忽略数据和模型文件夹
 data/
 models/
-outputs/checkpoints/
+outputs/
+inference_test/
 *.pth
 *.pt
 *.pkl

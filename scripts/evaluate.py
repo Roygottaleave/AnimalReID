@@ -10,8 +10,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import torch
 import timm
-from wildlife_tools.features import DeepFeatures
-from wildlife_datasets.data import ImageDataset
+from wildlife_tools.data.dataset import ImageDataset
+from wildlife_tools.features.deep import DeepFeatures
 from src.data.transforms import get_val_transforms
 import yaml
 
