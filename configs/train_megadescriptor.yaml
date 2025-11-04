@@ -3,12 +3,13 @@ project:
   seed: 42
 
 data:
-  root_dir: "data/raw/my_animal_dataset"
-  dataset_class: "MyAnimalDataset"
-  batch_size: 32
+  root_dir: "data/raw/good_test"
+  dataset_class: "GoodAnimalDataset"
+  batch_size: 32           # 根据数据量可适当调大
   num_workers: 4
-  split_ratio: 0.8
-  
+  split_ratio: 0.8         # train+val / total
+  val_ratio: 0.2           # train/val 内部分割
+
   augmentation:
     train:
       resize: 256
@@ -21,28 +22,41 @@ data:
       center_crop: 224
 
 model:
-  name: "MegaDescriptor-T-224"
+  # Hugging Face MegaDescriptor 预训练模型
+  name: "hf-hub:BVRA/MegaDescriptor-T-224"
   pretrained: true
   checkpoint_path: null
+  freeze_backbone: false    # True = 冻结 backbone，仅训练后续层 false = 全参数
 
 training:
-  epochs: 50
+  epochs: 30
   optimizer: "AdamW"
-  learning_rate: 0.0001
+  learning_rate: 1e-4      # 对于 ArcFace / Triplet 可以先用 1e-4，必要时调小
   weight_decay: 0.01
   scheduler: "cosine"
-  
+
+  # 损失选择：arcface 或 triplet
   loss:
-    name: "ArcFace"
-    embedding_size: 768
-    margin: 0.5
-    scale: 64
-    label_smoothing: 0.1
+    name: "arcface"         # "arcface" 或 "triplet"
+    embedding_size: 768 #768
+
+    # ArcFace 专用参数
+    arcface:
+      scale: 64
+      margin: 0.5
+      label_smoothing: 0.0
+
+    # Triplet 专用参数
+    triplet:
+      margin: 0.3
+      mining: "semi-hard"   # "random" 或 "semi-hard"
 
   accumulation_steps: 1
   early_stopping_patience: 15
+  device: "cpu"           # "cuda" 或 "cpu"
 
 output:
   checkpoint_dir: "outputs/checkpoints"
   log_dir: "outputs/logs"
-  save_frequency: 5
+  save_frequency: 5        # 每多少个 epoch 保存一次模型
+  val_frequency: 5         # 每多少个 epoch 计算一次验证指标

@@ -11,452 +11,506 @@ from wildlife_tools.features.deep import DeepFeatures
 import os
 from datetime import datetime
 import yaml
-import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import accuracy_score
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.data.datasets import MyAnimalDataset
 from src.data.transforms import get_train_transforms, get_val_transforms
 
+# 可选：保留随机三元组数据集，以便 mining=random 时使用
+class TripletDatasetRandom(torch.utils.data.Dataset):
+    def __init__(self, df, root, transform=None, col_path='path', col_label='identity'):
+        self.df = df.reset_index(drop=True)
+        self.root = root
+        self.transform = transform
+        self.col_path = col_path
+        self.col_label = col_label
+
+        # label -> indices
+        self.label_to_indices = {}
+        for idx, label in enumerate(self.df[self.col_label]):
+            self.label_to_indices.setdefault(label, []).append(idx)
+        self.labels = list(self.label_to_indices.keys())
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        import random
+        anchor_info = self.df.iloc[index]
+        anchor_label = anchor_info[self.col_label]
+        anchor_path = os.path.join(self.root, anchor_info[self.col_path])
+
+        # positive index different from anchor
+        pos_idx = index
+        while pos_idx == index:
+            pos_idx = random.choice(self.label_to_indices[anchor_label])
+        pos_info = self.df.iloc[pos_idx]
+        pos_path = os.path.join(self.root, pos_info[self.col_path])
+
+        # negative: choose any different label
+        neg_label = random.choice([l for l in self.labels if l != anchor_label])
+        neg_idx = random.choice(self.label_to_indices[neg_label])
+        neg_info = self.df.iloc[neg_idx]
+        neg_path = os.path.join(self.root, neg_info[self.col_path])
+
+        from PIL import Image
+        a = Image.open(anchor_path).convert("RGB")
+        p = Image.open(pos_path).convert("RGB")
+        n = Image.open(neg_path).convert("RGB")
+
+        if self.transform:
+            a = self.transform(a)
+            p = self.transform(p)
+            n = self.transform(n)
+
+        return a, p, n, anchor_label
+
+
 class MegaDescriptorFinetuner:
-    """MegaDescriptor微调器"""
-    
+    """MegaDescriptor 微调器（支持 ArcFace 和 Triplet；Triplet 支持 semi-hard mining）"""
     def __init__(self, config_path):
         self.config = self._load_config(config_path)
         self.device = torch.device(self.config['training'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self._setup_directories()
         set_seed(self.config['project']['seed'])
-        
+
     def _load_config(self, config_path):
-        """加载配置文件"""
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
-    
+
     def _setup_directories(self):
-        """创建输出目录"""
         os.makedirs(self.config['output']['checkpoint_dir'], exist_ok=True)
         os.makedirs(self.config['output']['log_dir'], exist_ok=True)
-        # 确保splits目录存在
         os.makedirs("data/splits", exist_ok=True)
-    
+
     def _save_checkpoint(self, epoch, metric_value):
-        """保存检查点"""
         checkpoint = {
             'epoch': epoch,
             'backbone_state_dict': self.backbone.state_dict(),
-            'objective_state_dict': self.objective.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'metric_value': metric_value,
             'config': self.config,
             'timestamp': datetime.now().isoformat()
         }
-        
-        checkpoint_path = os.path.join(
-            self.config['output']['checkpoint_dir'], 
-            f'checkpoint_epoch_{epoch:03d}.pth'
-        )
-        
+        checkpoint_path = os.path.join(self.config['output']['checkpoint_dir'], f'checkpoint_epoch_{epoch:03d}.pth')
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved: {checkpoint_path}")
-    
-    def _save_split_info(self, idx_train, idx_test):
-        """保存数据分割信息"""
-        split_info = {
-            'timestamp': datetime.now().isoformat(),
-            'config': {
-                'data_root': self.config['data']['root_dir'],
-                'split_ratio': self.config['data']['split_ratio'],
-                'seed': self.config['project']['seed']
-            },
-            'train_files': self.custom_dataset.df.loc[idx_train]['path'].tolist(),
-            'val_files': self.custom_dataset.df.loc[idx_test]['path'].tolist(),
-            'train_indices': idx_train.tolist(),
-            'val_indices': idx_test.tolist(),
-            'train_individuals': self.custom_dataset.df.loc[idx_train]['identity'].unique().tolist(),
-            'val_individuals': self.custom_dataset.df.loc[idx_test]['identity'].unique().tolist()
-        }
-        
-        # 使用时间戳和配置信息创建唯一的文件名
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        split_filename = f"split_{timestamp}.yaml"
-        split_path = os.path.join("data/splits", split_filename)
-        
-        with open(split_path, 'w') as f:
-            yaml.dump(split_info, f, default_flow_style=False)
-        
-        print(f"数据分割信息已保存: {split_path}")
-        return split_path
-    
-    def _validate_data_split(self, idx_train, idx_test):
-        """验证数据分割的合理性"""
-        print("验证数据分割...")
-        
-        # 检查训练集和验证集是否有重叠
-        train_set = set(idx_train)
-        val_set = set(idx_test)
-        overlap = train_set.intersection(val_set)
-        
-        if overlap:
-            raise ValueError(f"数据分割错误: 训练集和验证集有 {len(overlap)} 个重叠样本")
-        
-        # 检查每个个体在训练集和验证集中是否都有样本
-        train_individuals = set(self.custom_dataset.df.loc[idx_train]['identity'].unique())
-        val_individuals = set(self.custom_dataset.df.loc[idx_test]['identity'].unique())
-        
-        missing_in_val = train_individuals - val_individuals
-        missing_in_train = val_individuals - train_individuals
-        
-        if missing_in_val:
-            print(f"警告: 以下个体在验证集中缺失: {missing_in_val}")
-        
-        if missing_in_train:
-            print(f"警告: 以下个体在训练集中缺失: {missing_in_train}")
-        
-        # 统计信息
-        train_count = len(idx_train)
-        val_count = len(idx_test)
-        total_count = train_count + val_count
-        
-        print(f"数据分割验证通过")
-        print(f"  训练集: {train_count} 图像, {len(train_individuals)} 个体")
-        print(f"  验证集: {val_count} 图像, {len(val_individuals)} 个体")
-        print(f"  分割比例: {train_count/total_count:.2%} 训练, {val_count/total_count:.2%} 验证")
-        
-        return True
-    
+
     def prepare_data(self):
-        """准备训练数据"""
         print("Preparing data...")
-        
-        # 创建自定义数据集
         self.custom_dataset = MyAnimalDataset(self.config['data']['root_dir'])
-        
-        # 分析数据集
         self.custom_dataset.analyze_dataset()
-        
-        # 数据分割
+
+        # 使用 ClosedSetSplit 先划分训练+验证，再划分最终测试集
         splitter = splits.ClosedSetSplit(ratio_train=self.config['data']['split_ratio'])
-        splits_list = splitter.split(self.custom_dataset.df)
-        
-        # 取第一个分割结果
-        idx_train, idx_test = splits_list[0]
-        
-        # 验证数据分割
-        self._validate_data_split(idx_train, idx_test)
-        
-        # 保存分割信息
-        self.split_info_path = self._save_split_info(idx_train, idx_test)
-        
-        self.df_train = self.custom_dataset.df.loc[idx_train]
-        self.df_test = self.custom_dataset.df.loc[idx_test]
-        
-        # 创建数据变换
+        idx_trainval, idx_test = splitter.split(self.custom_dataset.df)[0]  # train+val, test
+        train_val_df = self.custom_dataset.df.loc[idx_trainval].reset_index(drop=True)
+        test_df = self.custom_dataset.df.loc[idx_test].reset_index(drop=True)
+
+        # 再对 train_val_df 做 train/val 划分
+        val_ratio = self.config['data'].get('val_ratio', 0.2)
+        num_val = int(len(train_val_df) * val_ratio)
+        self.df_val = train_val_df.sample(n=num_val, random_state=self.config['project']['seed']).reset_index(drop=True)
+        self.df_train = train_val_df.drop(self.df_val.index).reset_index(drop=True)
+        self.df_test = test_df  # 测试集仅用于最终评估
+
         train_transform = get_train_transforms(self.config)
         val_transform = get_val_transforms(self.config)
-        
-        # 创建ImageDataset
-        self.train_dataset = ImageDataset(
-            metadata=self.df_train,
-            root=self.config['data']['root_dir'],
-            transform=train_transform,
-            col_path='path',
-            col_label='identity'
-        )
-        
+        test_transform = get_val_transforms(self.config)
+
+        loss_name = self.config['training']['loss']['name'].lower()
+        triplet_mining = self.config['training']['loss'].get('triplet', {}).get('mining', 'random')
+
+        if loss_name == "triplet" and triplet_mining == "random":
+            self.train_dataset = TripletDatasetRandom(
+                df=self.df_train,
+                root=self.config['data']['root_dir'],
+                transform=train_transform
+            )
+            self.train_loader = DataLoader(self.train_dataset, batch_size=self.config['data']['batch_size'],
+                                           shuffle=True, num_workers=self.config['data']['num_workers'])
+        else:
+            self.train_dataset = ImageDataset(
+                metadata=self.df_train,
+                root=self.config['data']['root_dir'],
+                transform=train_transform,
+                col_path='path',
+                col_label='identity'
+            )
+            self.train_loader = DataLoader(self.train_dataset, batch_size=self.config['data']['batch_size'],
+                                           shuffle=True, num_workers=self.config['data']['num_workers'])
+
         self.val_dataset = ImageDataset(
-            metadata=self.df_test,
+            metadata=self.df_val,
             root=self.config['data']['root_dir'],
             transform=val_transform,
             col_path='path',
             col_label='identity'
         )
-        
-        print("Data preparation completed")
-        print(f"Training set: {len(self.train_dataset)} images, {self.train_dataset.num_classes} individuals")
-        print(f"Validation set: {len(self.val_dataset)} images, {self.val_dataset.num_classes} individuals")
-        
-        return self.train_dataset.num_classes
-    
-    def setup_model(self, num_classes):
-        """设置模型、损失函数和优化器"""
-        print("Initializing model...")
-        
-        # 加载MegaDescriptor骨干网络
-        self.backbone = timm.create_model('hf-hub:BVRA/MegaDescriptor-T-224', num_classes=0, pretrained=True)
-        
-        # 创建ArcFace损失函数
-        loss_config = self.config['training']['loss']
-        self.objective = ArcFaceLoss(
-            num_classes=num_classes,
-            embedding_size=loss_config['embedding_size'],
-            margin=loss_config['margin'],
-            scale=loss_config['scale']
+        self.val_loader = DataLoader(self.val_dataset, batch_size=self.config['data']['batch_size'],
+                                     shuffle=False, num_workers=self.config['data']['num_workers'])
+
+        self.test_dataset = ImageDataset(
+            metadata=self.df_test,
+            root=self.config['data']['root_dir'],
+            transform=test_transform,
+            col_path='path',
+            col_label='identity'
         )
-        
-        # 设置优化器
-        params = itertools.chain(self.backbone.parameters(), self.objective.parameters())
-        
-        # 确保学习率和权重衰减是正确类型
+        self.test_loader = DataLoader(self.test_dataset, batch_size=self.config['data']['batch_size'],
+                                      shuffle=False, num_workers=self.config['data']['num_workers'])
+
+        print("Data preparation completed")
+        print(f"Training samples: {len(self.train_dataset)}")
+        print(f"Validation samples: {len(self.val_dataset)}")
+        print(f"Testing samples: {len(self.test_dataset)}")
+
+        return len(self.custom_dataset.df['identity'].unique())
+
+    def setup_model(self, num_classes):
+        print("Initializing model...")
+        self.backbone = timm.create_model(self.config['model']['name'], num_classes=0,
+                                          pretrained=self.config['model'].get('pretrained', True))
+        self.backbone.to(self.device)
+
+        if self.config['model'].get('freeze_backbone', False):
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            print("Backbone frozen: True")
+        else:
+            print("Backbone frozen: False")
+
+        loss_cfg = self.config['training']['loss']
+        loss_name = loss_cfg['name'].lower()
+
+        if loss_name == 'arcface':
+            arc_cfg = loss_cfg.get('arcface', {})
+            scale = float(arc_cfg.get('scale', 64.0))
+            margin = float(arc_cfg.get('margin', 0.5))
+            self.objective = ArcFaceLoss(num_classes=num_classes,
+                                         embedding_size=int(self.config['training']['loss'].get('embedding_size', 768)),
+                                         margin=margin, scale=scale)
+            print("Using ArcFaceLoss")
+            params = itertools.chain(self.backbone.parameters(), self.objective.parameters())
+        elif loss_name == 'triplet':
+            trip_cfg = loss_cfg.get('triplet', {})
+            margin = float(trip_cfg.get('margin', 0.3))
+            self.objective = nn.TripletMarginLoss(margin=margin, p=2, reduction='mean')
+            print(f"Using TripletMarginLoss with margin={margin}")
+            params = self.backbone.parameters()
+        else:
+            raise ValueError(f"Unsupported loss: {loss_name}")
+
         lr = float(self.config['training']['learning_rate'])
         weight_decay = float(self.config['training']['weight_decay'])
-        
+
         if self.config['training']['optimizer'].lower() == 'adamw':
-            self.optimizer = AdamW(
-                params=params,
-                lr=lr,
-                weight_decay=weight_decay
-            )
+            self.optimizer = AdamW(params=params, lr=lr, weight_decay=weight_decay)
         else:
-            self.optimizer = SGD(
-                params=params,
-                lr=lr,
-                momentum=0.9,
-                weight_decay=weight_decay
-            )
-        
-        # 学习率调度器
+            self.optimizer = SGD(params=params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+
         if self.config['training']['scheduler'] == 'cosine':
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer, 
-                T_max=self.config['training']['epochs']
-            )
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.config['training']['epochs'])
         else:
             self.scheduler = None
-        
+
         print("Model initialization completed")
-        print(f"Backbone: {self.config['model']['name']}")
-        print(f"Number of classes: {num_classes}")
-        print(f"Optimizer: {self.config['training']['optimizer']}")
-        print(f"Learning rate: {lr}")
-    
-    def compute_validation_metrics(self):
-        """计算验证集上的评估指标"""
+
+    def compute_metrics(self, dataset, name="Dataset"):
+        """
+        Compute evaluation metrics: mAP, CMC (rank-1,5,10).
+        Includes safe normalization and debug printing to avoid overflow / NaN issues.
+        """
         self.backbone.eval()
+        feature_extractor = DeepFeatures(model=self.backbone,
+                                         batch_size=self.config['data']['batch_size'],
+                                         num_workers=self.config['data']['num_workers'],
+                                         device=str(self.device))
+        print(f"Extracting features for {name}...")
+        features = feature_extractor(dataset)
+        emb = features.features
+
+        # 防止数值过大 / nan / inf
+        emb = np.nan_to_num(emb, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        # L2 normalize safely
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1e-10
+        features_array = emb / norms
+
+        labels = dataset.labels
         
-        # 提取特征
-        feature_extractor = DeepFeatures(
-            model=self.backbone,
-            batch_size=self.config['data']['batch_size'],
-            num_workers=self.config['data']['num_workers'],
-            device=str(self.device)
-        )
+        # 添加标签调试信息
+        print(f"[DEBUG] Label mapping:")
+        unique_labels = np.unique(labels)
+        for label in unique_labels:
+            label_indices = np.where(labels == label)[0]
+            print(f"  Label {label}: {len(label_indices)} samples")
         
-        print("Extracting features for validation metrics...")
-        train_features = feature_extractor(self.train_dataset)
-        val_features = feature_extractor(self.val_dataset)
+        # 如果是数字标签，尝试获取原始标签名
+        if hasattr(dataset, 'df') and 'identity' in dataset.df.columns:
+            original_labels = dataset.df['identity'].values
+            print(f"[DEBUG] Original label names: {np.unique(original_labels)}")       
+
+        # 构建 query/gallery
+        query_indices, gallery_indices = [], []
+        identity_to_indices = {}
+        for idx, label in enumerate(labels):
+            identity_to_indices.setdefault(label, []).append(idx)
+        for inds in identity_to_indices.values():
+            query_indices.append(inds[0])
+            gallery_indices.extend(inds[1:])
         
-        # 计算相似度矩阵
-        similarity_matrix = cosine_similarity(val_features.features, train_features.features)
-        
-        # 计算mAP
+        if len(gallery_indices) == 0:
+            gallery_indices = query_indices.copy()
+
+        query_feats = features_array[query_indices]
+        query_labels = [labels[i] for i in query_indices]
+        gallery_feats = features_array[gallery_indices]
+        gallery_labels = [labels[i] for i in gallery_indices]
+
+        # 稳定的余弦相似度计算
+        def stable_cosine_similarity(a, b):
+            epsilon = 1e-10
+            a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + epsilon)
+            b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + epsilon)
+            similarity = np.dot(a_norm, b_norm.T)
+            similarity = np.clip(similarity, -1.0, 1.0)
+            return similarity
+
+        similarity_matrix = stable_cosine_similarity(query_feats, gallery_feats)
+
+        # mAP 计算
         average_precisions = []
-        for i in range(len(self.val_dataset.labels)):
-            query_label = self.val_dataset.labels[i]
-            # 获取排序的索引（相似度从高到低）
+        for i, q_label in enumerate(query_labels):
             sorted_indices = np.argsort(similarity_matrix[i])[::-1]
-            # 计算AP
             relevant = 0
             precision_at_k = []
             for k, idx in enumerate(sorted_indices):
-                if self.train_dataset.labels[idx] == query_label:
+                if gallery_labels[idx] == q_label:
                     relevant += 1
                     precision_at_k.append(relevant / (k + 1))
-            if relevant > 0:
-                ap = np.mean(precision_at_k)
-                average_precisions.append(ap)
-            else:
-                average_precisions.append(0)
-        
+            ap = np.mean(precision_at_k) if relevant > 0 else 0
+            average_precisions.append(ap)
         mean_ap = np.mean(average_precisions)
-        
-        # 计算CMC曲线 (Rank-k 识别率)
+
+        # CMC 计算
         ranks = [1, 5, 10]
         cmc_scores = {}
-        
         for rank in ranks:
             correct = 0
-            for i in range(len(self.val_dataset.labels)):
-                query_label = self.val_dataset.labels[i]
+            for i, q_label in enumerate(query_labels):
                 sorted_indices = np.argsort(similarity_matrix[i])[::-1]
-                # 检查前rank个结果中是否有正确匹配
-                if any(self.train_dataset.labels[idx] == query_label for idx in sorted_indices[:rank]):
+                if any(gallery_labels[idx] == q_label for idx in sorted_indices[:rank]):
                     correct += 1
-            cmc_scores[rank] = correct / len(self.val_dataset.labels)
-        
-        # 计算最近邻分类准确率
-        knn = KNeighborsClassifier(n_neighbors=1, metric='cosine')
-        knn.fit(train_features.features, self.train_dataset.labels)
-        knn_predictions = knn.predict(val_features.features)
-        knn_accuracy = accuracy_score(self.val_dataset.labels, knn_predictions)
-        
+            cmc_scores[rank] = correct / len(query_labels)
+
         self.backbone.train()
+
+        # 在返回前添加详细分析
+        print(f"[ANALYSIS] {name} - Query: {len(query_labels)}, Gallery: {len(gallery_labels)}")
+        print(f"[ANALYSIS] Unique query labels: {len(set(query_labels))}")
+        print(f"[ANALYSIS] Unique gallery labels: {len(set(gallery_labels))}")
         
-        return {
-            'mAP': mean_ap,
-            'rank1': cmc_scores[1],
-            'rank5': cmc_scores[5],
-            'rank10': cmc_scores[10],
-            'knn_accuracy': knn_accuracy
-        }
-    
+        # 分析相似度矩阵
+        print(f"[ANALYSIS] Similarity matrix range: [{similarity_matrix.min():.3f}, {similarity_matrix.max():.3f}]")
+        
+        # 检查每个query的最佳匹配
+        for i, q_label in enumerate(query_labels[:3]):  # 只看前3个
+            best_match_idx = np.argmax(similarity_matrix[i])
+            best_match_label = gallery_labels[best_match_idx]
+            best_similarity = similarity_matrix[i, best_match_idx]
+            print(f"[ANALYSIS] Query {i} (label {q_label}) -> Best match: {best_match_label}, similarity: {best_similarity:.3f}")
+
+        return {'mAP': mean_ap, 'rank1': cmc_scores[1], 'rank5': cmc_scores[5], 'rank10': cmc_scores[10]}
+
+    def _embeddings_from_batch(self, images):
+        self.backbone.eval()
+        with torch.no_grad():
+            images = images.to(self.device)
+            emb = self.backbone(images)
+            if isinstance(emb, tuple):
+                emb = emb[0]
+            emb = emb.detach()
+        return emb.cpu()
+
+    def _batch_semi_hard_triplets(self, embeddings, labels, margin):
+        if isinstance(labels, torch.Tensor):
+            labels = labels.numpy()
+        emb_np = embeddings.numpy()
+        B = emb_np.shape[0]
+        dists = np.linalg.norm(emb_np[:, None, :] - emb_np[None, :, :], axis=2)
+        triplets = []
+        for a in range(B):
+            a_label = labels[a]
+            pos_indices = np.where(labels == a_label)[0]
+            neg_indices = np.where(labels != a_label)[0]
+            pos_indices = pos_indices[pos_indices != a]
+            if len(pos_indices) == 0 or len(neg_indices) == 0:
+                continue
+            p = np.random.choice(pos_indices)
+            dist_ap = dists[a, p]
+            cand_neg = [n for n in neg_indices if dists[a, n] > dist_ap and dists[a, n] < dist_ap + margin]
+            if len(cand_neg) > 0:
+                n = np.random.choice(cand_neg)
+            else:
+                n = neg_indices[np.argmin(dists[a, neg_indices])]
+            triplets.append((a, p, n))
+        return triplets
+
     def create_trainer(self):
-        """创建训练器"""
-        
-        # 初始化最佳指标跟踪
+        loss_name = self.config['training']['loss']['name'].lower()
+        val_freq = self.config['output'].get('val_frequency', 5)
         self.best_mAP = 0.0
-        self.best_rank1 = 0.0
-        
+        self.current_epoch = 0  # 添加当前epoch计数器
+
         def epoch_callback(trainer, epoch_data):
-            """训练回调函数 - 修正以正确获取训练损失"""
-            # 正确获取训练损失
+            self.current_epoch += 1
             train_loss = epoch_data.get('train_loss_epoch_avg', 0.0)
-            
-            # 从优化器获取当前学习率
             current_lr = self.optimizer.param_groups[0]['lr']
             
-            # 每5个epoch或在最后一个epoch计算验证指标
-            validation_metrics = None
-            if trainer.epoch % 5 == 0 or trainer.epoch == self.config['training']['epochs']:
-                validation_metrics = self.compute_validation_metrics()
-                
-                # 更新最佳指标
+            # 只在val_frequency指定的epoch进行验证
+            if self.current_epoch % val_freq == 0 or self.current_epoch == self.config['training']['epochs']:
+                validation_metrics = self.compute_metrics(self.val_dataset, name="Validation Set")
                 if validation_metrics['mAP'] > self.best_mAP:
                     self.best_mAP = validation_metrics['mAP']
-                if validation_metrics['rank1'] > self.best_rank1:
-                    self.best_rank1 = validation_metrics['rank1']
-            
-            # 格式化输出
-            if validation_metrics:
-                print(f"Epoch {trainer.epoch:3d}/{self.config['training']['epochs']} | "
-                      f"LR: {current_lr:.2e} | "
-                      f"Train Loss: {train_loss:.4f} | "
+                print(f"Epoch {self.current_epoch:3d}/{self.config['training']['epochs']} | "
+                      f"LR: {current_lr:.2e} | Train Loss: {train_loss:.4f} | "
                       f"Val-mAP: {validation_metrics['mAP']:.4f} | "
                       f"Rank-1: {validation_metrics['rank1']:.4f} | "
-                      f"Rank-5: {validation_metrics['rank5']:.4f} | "
-                      f"KNN-Acc: {validation_metrics['knn_accuracy']:.4f}")
+                      f"Rank-5: {validation_metrics['rank5']:.4f}")
+                
+                if self.current_epoch % self.config['output']['save_frequency'] == 0 or self.current_epoch == self.config['training']['epochs']:
+                    self._save_checkpoint(self.current_epoch, validation_metrics['mAP'])
             else:
-                print(f"Epoch {trainer.epoch:3d}/{self.config['training']['epochs']} | "
-                      f"LR: {current_lr:.2e} | "
-                      f"Train Loss: {train_loss:.4f}")
-            
-            # 保存检查点
-            save_checkpoint = False
-            if trainer.epoch % self.config['output']['save_frequency'] == 0:
-                save_checkpoint = True
-            
-            # 如果是最后一个epoch，保存最终模型
-            if trainer.epoch == self.config['training']['epochs']:
-                save_checkpoint = True
-            
-            # 如果达到新的最佳mAP，也保存检查点
-            if validation_metrics and validation_metrics['mAP'] == self.best_mAP:
-                save_checkpoint = True
-                print(f"  *** New best mAP: {validation_metrics['mAP']:.4f} ***")
-            
-            if save_checkpoint:
-                metric_value = validation_metrics['mAP'] if validation_metrics else train_loss
-                self._save_checkpoint(trainer.epoch, metric_value)
-        
-        # 创建BasicTrainer
-        self.trainer = BasicTrainer(
-            dataset=self.train_dataset,
-            model=self.backbone,
-            objective=self.objective,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
-            epochs=self.config['training']['epochs'],
-            device=self.device,
-            batch_size=self.config['data']['batch_size'],
-            num_workers=self.config['data']['num_workers'],
-            accumulation_steps=self.config['training']['accumulation_steps'],
-            epoch_callback=epoch_callback
-        )
-        
+                # 不验证时只打印训练信息
+                print(f"Epoch {self.current_epoch:3d}/{self.config['training']['epochs']} | "
+                      f"LR: {current_lr:.2e} | Train Loss: {train_loss:.4f}")
+
+        if self.config['training']['loss']['name'].lower() == 'arcface':
+            self.trainer = BasicTrainer(
+                dataset=self.train_dataset,
+                model=self.backbone,
+                objective=self.objective,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                epochs=self.config['training']['epochs'],
+                device=self.device,
+                batch_size=self.config['data']['batch_size'],
+                num_workers=self.config['data']['num_workers'],
+                accumulation_steps=self.config['training']['accumulation_steps'],
+                epoch_callback=epoch_callback
+            )
+        else:
+            self.trainer = None
         return self.trainer
-    
+
     def train(self):
-        """执行训练"""
         print("=" * 60)
         print("MegaDescriptor Fine-tuning Training")
         print("=" * 60)
-        
-        start_time = datetime.now()
-        
-        # 准备数据
+
         num_classes = self.prepare_data()
-        
-        # 设置模型
         self.setup_model(num_classes)
-        
-        # 创建训练器
         trainer = self.create_trainer()
-        
-        print("Starting training...")
-        print(f"Device: {self.device}")
-        print(f"Epochs: {self.config['training']['epochs']}")
-        print(f"Batch size: {self.config['data']['batch_size']}")
-        print(f"Gradient accumulation: {self.config['training']['accumulation_steps']}")
-        print("Validation metrics will be computed every 5 epochs")
-        
-        # 开始训练
-        trainer.train()
-        
-        end_time = datetime.now()
-        training_duration = end_time - start_time
-        
-        # 输出最终评估结果
-        print("\n" + "=" * 60)
-        print("Final Evaluation Results")
-        print("=" * 60)
-        final_metrics = self.compute_validation_metrics()
-        print(f"Mean Average Precision (mAP): {final_metrics['mAP']:.4f}")
-        print(f"Rank-1 Accuracy: {final_metrics['rank1']:.4f}")
-        print(f"Rank-5 Accuracy: {final_metrics['rank5']:.4f}")
-        print(f"Rank-10 Accuracy: {final_metrics['rank10']:.4f}")
-        print(f"KNN Classification Accuracy: {final_metrics['knn_accuracy']:.4f}")
-        print(f"Best mAP during training: {self.best_mAP:.4f}")
-        print(f"Best Rank-1 during training: {self.best_rank1:.4f}")
-        
-        print("\nTraining completed!")
-        print(f"Total duration: {training_duration}")
-        
-        # 保存最终模型
-        final_checkpoint = {
-            'backbone_state_dict': self.backbone.state_dict(),
-            'objective_state_dict': self.objective.state_dict(),
-            'num_classes': num_classes,
-            'config': self.config,
-            'training_duration': str(training_duration),
-            'completed_at': datetime.now().isoformat(),
-            'final_metrics': final_metrics,
-            'best_mAP': self.best_mAP,
-            'best_rank1': self.best_rank1
-        }
-        
+
+        loss_name = self.config['training']['loss']['name'].lower()
+        trip_cfg = self.config['training']['loss'].get('triplet', {})
+        triplet_mining = trip_cfg.get('mining', 'random').lower()
+
+        # --- ArcFace training ---
+        if loss_name == 'arcface':
+            print("Starting ArcFace training (using BasicTrainer)...")
+            print(f"Device: {self.device}")
+            trainer.train()
+
+        # --- Triplet random ---
+        elif loss_name == 'triplet' and triplet_mining == 'random':
+            print("Starting Triplet (random sampling) training...")
+            epochs = self.config['training']['epochs']
+            margin = float(trip_cfg.get('margin', 0.3))
+            for epoch in range(1, epochs + 1):
+                self.backbone.train()
+                running_loss = 0.0
+                count = 0
+                for batch in tqdm(self.train_loader, desc=f"Epoch {epoch}/{epochs}"):
+                    a, p, n, labels = batch
+                    a, p, n = a.to(self.device), p.to(self.device), n.to(self.device)
+                    emb_a = self.backbone(a)
+                    emb_p = self.backbone(p)
+                    emb_n = self.backbone(n)
+                    loss = self.objective(emb_a, emb_p, emb_n)
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                    running_loss += loss.item()
+                    count += 1
+                if self.scheduler:
+                    self.scheduler.step()
+                avg_loss = running_loss / max(1, count)
+                validation_metrics = self.compute_metrics(self.val_dataset, name="Validation Set")
+                if validation_metrics['mAP'] > self.best_mAP:
+                    self.best_mAP = validation_metrics['mAP']
+                print(f"Epoch {epoch}/{epochs} | Train Loss: {avg_loss:.4f} | "
+                      f"Val-mAP: {validation_metrics['mAP']:.4f} | Rank-1: {validation_metrics['rank1']:.4f}")
+                if epoch % self.config['output']['save_frequency'] == 0 or epoch == epochs:
+                    self._save_checkpoint(epoch, validation_metrics['mAP'])
+
+        # --- Triplet semi-hard ---
+        elif loss_name == 'triplet' and triplet_mining == 'semi-hard':
+            print("Starting Triplet training with semi-hard mining (batch-based)...")
+            epochs = self.config['training']['epochs']
+            margin = float(trip_cfg.get('margin', 0.3))
+            val_freq = self.config['output'].get('val_frequency', 5)
+            for epoch in range(1, epochs + 1):
+                self.backbone.train()
+                running_loss = 0.0
+                count = 0
+                for batch in tqdm(self.train_loader, desc=f"Epoch {epoch}/{epochs}"):
+                    images, labels = batch
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    emb = self.backbone(images)
+                    if isinstance(emb, tuple):
+                        emb = emb[0]
+                    emb_cpu = emb.detach().cpu()
+                    labels_cpu = labels.detach().cpu()
+                    triplets = self._batch_semi_hard_triplets(emb_cpu, labels_cpu, margin)
+                    if len(triplets) == 0:
+                        continue
+                    idx_a = torch.tensor([t[0] for t in triplets], dtype=torch.long, device=self.device)
+                    idx_p = torch.tensor([t[1] for t in triplets], dtype=torch.long, device=self.device)
+                    idx_n = torch.tensor([t[2] for t in triplets], dtype=torch.long, device=self.device)
+                    emb_a = emb[idx_a]
+                    emb_p = emb[idx_p]
+                    emb_n = emb[idx_n]
+                    loss = self.objective(emb_a, emb_p, emb_n)
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                    running_loss += loss.item()
+                    count += 1
+                if self.scheduler:
+                    self.scheduler.step()
+                avg_loss = running_loss / max(1, count)
+                validation_metrics = self.compute_metrics(self.val_dataset, name="Validation Set")
+                if validation_metrics['mAP'] > self.best_mAP:
+                    self.best_mAP = validation_metrics['mAP']
+                print(f"Epoch {epoch}/{epochs} | Train Loss: {avg_loss:.4f} | "
+                      f"Val-mAP: {validation_metrics['mAP']:.4f} | Rank-1: {validation_metrics['rank1']:.4f}")
+                if epoch % self.config['output']['save_frequency'] == 0 or epoch == epochs:
+                    self._save_checkpoint(epoch, validation_metrics['mAP'])
+        else:
+            raise ValueError("Unsupported training configuration.")
+
+        # --- 最终在测试集上评估 ---
+        print("\nFinal Evaluation on Testing Set")
+        final_metrics = self.compute_metrics(self.test_dataset, name="Testing Set")
+        print(final_metrics)
         final_path = os.path.join(self.config['output']['checkpoint_dir'], 'final_model.pth')
-        torch.save(final_checkpoint, final_path)
+        torch.save({'backbone_state_dict': self.backbone.state_dict(), 'final_metrics': final_metrics}, final_path)
         print(f"Final model saved: {final_path}")
-        
         return final_path
-    
-    def extract_features(self, dataset=None):
-        """使用训练好的模型提取特征"""
-        if dataset is None:
-            dataset = self.val_dataset
-        
-        print("Extracting features...")
-        
-        feature_extractor = DeepFeatures(
-            model=self.backbone,
-            batch_size=self.config['data']['batch_size'],
-            num_workers=self.config['data']['num_workers'],
-            device=str(self.device)
-        )
-        
-        features = feature_extractor(dataset)
-        print(f"Feature extraction completed: {features.features.shape}")
-        
-        return features
